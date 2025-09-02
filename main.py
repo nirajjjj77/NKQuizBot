@@ -1,4 +1,5 @@
 from telethon import TelegramClient, events, Button
+from telethon.tl import functions, types
 from telethon.tl.types import ChannelParticipantsAdmins, UpdateMessagePollVote
 import random, asyncio, json, os, re
 from dataclasses import dataclass, field
@@ -391,23 +392,37 @@ async def send_quiz_question(group_id):
         
         question_id, question_text, opt_a, opt_b, opt_c, opt_d, correct_answer, category = question[:8]
         
-        # Create poll options
-        options = [opt_a, opt_b, opt_c, opt_d]
         
-        # Send poll
-        poll = await client.send_message(
-            group_id,
-            f"📚 **Quiz Time!** 📚\n\n**Category:** {category}\n\n{question_text}",
-            poll=True,
-            poll_question=question_text,
-            poll_options=options
+        # Build poll object
+        poll = types.Poll(
+            id=0,
+            question=question_text,
+            answers=[
+                types.PollAnswer(text=opt_a, option=b"A"),
+                types.PollAnswer(text=opt_b, option=b"B"),
+                types.PollAnswer(text=opt_c, option=b"C"),
+                types.PollAnswer(text=opt_d, option=b"D"),
+            ],
+            multiple_choice=False,
+            quiz=True,
+            correct_answers=[bytes([65 + correct_answer])]  # "A", "B", "C", "D"
         )
-        
-        # Store active poll
-        store_active_poll(group_id, poll.poll.id, question_id, poll.id)
-        
+
+        # Send poll via request
+        result = await client(
+            functions.messages.SendMessageRequest(
+                peer=group_id,
+                message=f"📚 **Quiz Time!** 📚\n\n**Category:** {category}\n\n{question_text}",
+                media=types.InputMediaPoll(poll=poll),
+                random_id=random.randint(1, 999999999)
+            )
+        )
+
+        # Store poll info
+        store_active_poll(group_id, str(poll.id), question_id, result.id)
+
         print(f"✅ Quiz question sent to group {group_id}")
-        
+
     except Exception as e:
         print(f"❌ Error sending quiz to group {group_id}: {e}")
 
