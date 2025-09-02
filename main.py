@@ -1,5 +1,5 @@
 from telethon import TelegramClient, events, Button
-from telethon.tl.types import ChannelParticipantsAdmins
+from telethon.tl.types import ChannelParticipantsAdmins, UpdateMessagePollVote
 import random, asyncio, json, os, re
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List
@@ -622,23 +622,34 @@ async def reset_board_handler(event):
     
     await event.respond("🔄 **Leaderboard reset!** All scores and statistics have been cleared. Fresh start for everyone! 🎯")
 
-@client.on(events.PollVoteUpdate)
+@client.on(events.Raw(types=[UpdateMessagePollVote]))
 async def poll_vote_handler(event):
     """Handle poll vote updates"""
     try:
-        group_id = event.chat_id
-        user_id = event.user_id
-        poll_id = event.poll.id
+        poll_update = event
+        user_id = poll_update.user_id
+        poll_id = poll_update.poll_id
+        
+        # Get the message to find group_id
+        message = await client.get_messages(poll_update.peer, ids=poll_update.msg_id)
+        if not message or not hasattr(message.peer_id, 'channel_id'):
+            return
+            
+        group_id = -1000000000000 - message.peer_id.channel_id
         
         # Get user info
-        user = await client.get_entity(user_id)
-        username = user.username
-        first_name = user.first_name or ""
+        try:
+            user = await client.get_entity(user_id)
+            username = user.username
+            first_name = user.first_name or ""
+        except:
+            username = None
+            first_name = "Unknown"
         
         # Add/update player
         add_or_update_player(user_id, group_id, username, first_name)
         
-        # Get the question info
+        # Get the question info from our database
         conn = sqlite3.connect('quiz_bot.db')
         cursor = conn.cursor()
         cursor.execute('''
@@ -646,7 +657,7 @@ async def poll_vote_handler(event):
             FROM active_polls ap
             JOIN questions q ON ap.question_id = q.id
             WHERE ap.group_id = ? AND ap.poll_id = ?
-        ''', (group_id, poll_id))
+        ''', (group_id, str(poll_id)))
         result = cursor.fetchone()
         conn.close()
         
@@ -655,11 +666,13 @@ async def poll_vote_handler(event):
         
         question_id, correct_answer = result
         
-        # Check if answer is correct
-        selected_option = event.options[0] if event.options else None
-        if selected_option is None:
+        # Get selected options from the vote
+        if not hasattr(poll_update, 'options') or not poll_update.options:
             return
+            
+        selected_option = poll_update.options[0]  # First selected option
         
+        # Check if answer is correct
         is_correct = selected_option == correct_answer
         points = 4 if is_correct else -1
         
