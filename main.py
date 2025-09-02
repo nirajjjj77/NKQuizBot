@@ -813,7 +813,7 @@ def get_all_groups():
     conn.close()
     return [row[0] for row in result]
 
-@client.on(events.NewMessage(pattern=r'/broadcast (.+)', flags=re.DOTALL))
+@client.on(events.NewMessage(pattern=r'(?s)/broadcast (.+)'))
 async def broadcast_handler(event):
     """Broadcast message to all users/groups"""
     if not event.is_private or not await is_owner(event):
