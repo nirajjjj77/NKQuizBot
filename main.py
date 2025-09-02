@@ -475,7 +475,7 @@ async def start_handler(event):
         ''', (user.id, user.username, user.first_name))
         conn.commit()
         conn.close()
-        
+
         await event.respond(
             "👋 Hi! I'm a Quiz Bot for groups.\n\n"
             "Add me to a group and use `/start` to begin the quiz fun! 🎯"
@@ -881,7 +881,7 @@ async def keep_alive():
     while True:
         try:
             async with aiohttp.ClientSession() as session:
-                await session.get("https://spygame-bjok.onrender.com")  # Replace with your actual URL
+                await session.get("https://nkquizbot.onrender.com")  # Replace with your actual URL
                 print("🌍 Keep-alive ping sent!")
         except Exception as e:
             print(f"⚠️ Keep-alive failed: {e}")
