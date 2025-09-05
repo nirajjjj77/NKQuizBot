@@ -1,934 +1,716 @@
-from telethon import TelegramClient, events, Button
-from telethon.tl import functions, types
-from telethon.tl.types import ChannelParticipantsAdmins, UpdateMessagePollVote
-import random, asyncio, json, os, re
-from dataclasses import dataclass, field
-from typing import Optional, Dict, List
-import threading
+# main.py — NK Quiz Bot (Dual DB: Supabase Postgres or local SQLite)
+# Telethon 1.34.0 + Flask keep-alive + aiosqlite/asyncpg
+# Features:
+# - Dual-mode DB: use POSTGRES if DATABASE_URL provided, else fallback to SQLite
+# - Same quiz features: per-group scheduler, polls (Telethon), leaderboard, admin checks
+# - Robust PM vs Group replies, owner-only commands, broadcast flow, inline add-to-group button
+# - Uses async DB drivers: asyncpg (Postgres) and aiosqlite (SQLite)
+
+import os
+import asyncio
+import random
+import json
+from datetime import datetime
+from typing import Optional, Tuple
+
 from flask import Flask
-from datetime import datetime, timezone
-import sqlite3
 import multiprocessing
 import aiohttp
 
-# ---------------- DATABASE SETUP ----------------
-def init_quiz_db():
-    """Initialize SQLite database for quiz bot"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    
-    # Groups table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS groups (
-            group_id INTEGER PRIMARY KEY,
-            group_name TEXT,
-            quiz_active BOOLEAN DEFAULT TRUE,
-            interval_minutes INTEGER DEFAULT 30,
-            last_question_id INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+from telethon import TelegramClient, events, Button
+from telethon.tl import functions, types
+from telethon.utils import get_peer_id
 
-    #users table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Players table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS players (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            group_id INTEGER,
-            username TEXT,
-            first_name TEXT,
-            score INTEGER DEFAULT 0,
-            correct_answers INTEGER DEFAULT 0,
-            wrong_answers INTEGER DEFAULT 0,
-            current_streak INTEGER DEFAULT 0,
-            max_streak INTEGER DEFAULT 0,
-            last_answer_time TIMESTAMP,
-            UNIQUE(user_id, group_id)
-        )
-    ''')
-    
-    # Questions table
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS questions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            question TEXT NOT NULL,
-            option_a TEXT NOT NULL,
-            option_b TEXT NOT NULL,
-            option_c TEXT NOT NULL,
-            option_d TEXT NOT NULL,
-            correct_answer INTEGER NOT NULL,
-            category TEXT DEFAULT 'General',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Question usage tracking per group
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS question_usage (
-            group_id INTEGER,
-            question_id INTEGER,
-            used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (group_id, question_id)
-        )
-    ''')
-    
-    # Active polls tracking
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS active_polls (
-            group_id INTEGER PRIMARY KEY,
-            poll_id TEXT,
-            question_id INTEGER,
-            message_id INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-    
-    # Insert default questions if not exists
-    insert_default_questions()
+# Optional DB drivers (ensure these are in requirements)
+# asyncpg for Postgres (Supabase), aiosqlite for SQLite async
+try:
+    import asyncpg
+except Exception:
+    asyncpg = None
+try:
+    import aiosqlite
+except Exception:
+    aiosqlite = None
 
-def insert_default_questions():
-    """Insert 50 default GK questions"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    
-    # Check if questions already exist
-    cursor.execute('SELECT COUNT(*) FROM questions')
-    if cursor.fetchone()[0] > 0:
-        conn.close()
-        return
-    
-    questions = [
-        ("What is the capital of France?", "London", "Berlin", "Paris", "Madrid", 2, "Geography"),
-        ("Which planet is known as the Red Planet?", "Venus", "Mars", "Jupiter", "Saturn", 1, "Science"),
-        ("Who wrote Romeo and Juliet?", "Charles Dickens", "William Shakespeare", "Mark Twain", "Jane Austen", 1, "Literature"),
-        ("What is the largest mammal in the world?", "Elephant", "Blue Whale", "Giraffe", "Hippopotamus", 1, "Biology"),
-        ("In which year did World War II end?", "1944", "1945", "1946", "1947", 1, "History"),
-        ("What is the chemical symbol for gold?", "Go", "Gd", "Au", "Ag", 2, "Chemistry"),
-        ("Which country is home to Machu Picchu?", "Brazil", "Argentina", "Peru", "Chile", 2, "Geography"),
-        ("Who painted the Mona Lisa?", "Vincent van Gogh", "Pablo Picasso", "Leonardo da Vinci", "Michelangelo", 2, "Art"),
-        ("What is the smallest prime number?", "0", "1", "2", "3", 2, "Mathematics"),
-        ("Which gas makes up about 78% of Earth's atmosphere?", "Oxygen", "Nitrogen", "Carbon Dioxide", "Argon", 1, "Science"),
-        ("What is the hardest natural substance on Earth?", "Gold", "Iron", "Diamond", "Platinum", 2, "Science"),
-        ("Which river is the longest in the world?", "Amazon", "Nile", "Mississippi", "Yangtze", 1, "Geography"),
-        ("Who was the first person to walk on the moon?", "Buzz Aldrin", "Neil Armstrong", "John Glenn", "Alan Shepard", 1, "History"),
-        ("What is the largest ocean on Earth?", "Atlantic", "Indian", "Arctic", "Pacific", 3, "Geography"),
-        ("Which element has the atomic number 1?", "Helium", "Hydrogen", "Lithium", "Carbon", 1, "Chemistry"),
-        ("In Greek mythology, who is the king of the gods?", "Poseidon", "Hades", "Zeus", "Apollo", 2, "Mythology"),
-        ("What is the speed of light in vacuum?", "299,792,458 m/s", "300,000,000 m/s", "299,000,000 m/s", "301,000,000 m/s", 0, "Physics"),
-        ("Which country has the most time zones?", "Russia", "USA", "China", "Canada", 0, "Geography"),
-        ("What is the currency of Japan?", "Yuan", "Won", "Yen", "Ringgit", 2, "Economics"),
-        ("Who composed The Four Seasons?", "Bach", "Mozart", "Vivaldi", "Beethoven", 2, "Music"),
-        ("What is the largest desert in the world?", "Sahara", "Gobi", "Antarctica", "Arabian", 2, "Geography"),
-        ("Which blood type is known as the universal donor?", "A+", "B+", "AB+", "O-", 3, "Biology"),
-        ("What is the square root of 144?", "11", "12", "13", "14", 1, "Mathematics"),
-        ("Which country invented pizza?", "Greece", "Italy", "France", "Spain", 1, "Culture"),
-        ("What is the boiling point of water at sea level?", "90°C", "95°C", "100°C", "105°C", 2, "Science"),
-        ("Who wrote '1984'?", "Aldous Huxley", "George Orwell", "Ray Bradbury", "H.G. Wells", 1, "Literature"),
-        ("What is the smallest country in the world?", "Monaco", "Vatican City", "San Marino", "Liechtenstein", 1, "Geography"),
-        ("Which instrument did Louis Armstrong play?", "Piano", "Trumpet", "Saxophone", "Drums", 1, "Music"),
-        ("What is the main ingredient in guacamole?", "Tomato", "Avocado", "Onion", "Pepper", 1, "Food"),
-        ("Which planet is closest to the Sun?", "Venus", "Mercury", "Earth", "Mars", 1, "Science"),
-        ("What does 'www' stand for?", "World Wide Web", "World Wide Network", "Web World Wide", "Wide World Web", 0, "Technology"),
-        ("Which animal is known as the 'Ship of the Desert'?", "Horse", "Camel", "Elephant", "Donkey", 1, "Biology"),
-        ("What is the capital of Australia?", "Sydney", "Melbourne", "Canberra", "Brisbane", 2, "Geography"),
-        ("Who invented the telephone?", "Thomas Edison", "Alexander Graham Bell", "Nikola Tesla", "Benjamin Franklin", 1, "History"),
-        ("What is the largest bone in the human body?", "Tibia", "Femur", "Humerus", "Fibula", 1, "Biology"),
-        ("Which metal is liquid at room temperature?", "Lead", "Mercury", "Tin", "Zinc", 1, "Chemistry"),
-        ("What is the study of earthquakes called?", "Geology", "Seismology", "Meteorology", "Volcanology", 1, "Science"),
-        ("Which vitamin is produced when skin is exposed to sunlight?", "Vitamin A", "Vitamin B", "Vitamin C", "Vitamin D", 3, "Biology"),
-        ("What is the longest river in South America?", "Orinoco", "Amazon", "Paraná", "Magdalena", 1, "Geography"),
-        ("Who painted 'The Starry Night'?", "Pablo Picasso", "Vincent van Gogh", "Claude Monet", "Salvador Dalí", 1, "Art"),
-        ("What is the chemical formula for water?", "H2O2", "H2O", "HO2", "H3O", 1, "Chemistry"),
-        ("Which continent is the Sahara Desert located on?", "Asia", "Africa", "Australia", "South America", 1, "Geography"),
-        ("What is the tallest mountain in the world?", "K2", "Mount Everest", "Kangchenjunga", "Lhotse", 1, "Geography"),
-        ("Who was the first President of the United States?", "Thomas Jefferson", "George Washington", "John Adams", "Benjamin Franklin", 1, "History"),
-        ("What is the largest planet in our solar system?", "Saturn", "Jupiter", "Neptune", "Uranus", 1, "Science"),
-        ("Which ocean is Bermuda located in?", "Pacific", "Atlantic", "Indian", "Arctic", 1, "Geography"),
-        ("What does 'CPU' stand for?", "Central Processing Unit", "Computer Processing Unit", "Central Program Unit", "Computer Program Unit", 0, "Technology"),
-        ("Which bird is a symbol of peace?", "Eagle", "Dove", "Swan", "Crane", 1, "Culture"),
-        ("What is the freezing point of water?", "-1°C", "0°C", "1°C", "2°C", 1, "Science"),
-        ("Who wrote 'Pride and Prejudice'?", "Emily Brontë", "Jane Austen", "Charlotte Brontë", "George Eliot", 1, "Literature")
-    ]
-    
-    cursor.executemany('''
-        INSERT INTO questions (question, option_a, option_b, option_c, option_d, correct_answer, category)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    ''', questions)
-    
-    conn.commit()
-    conn.close()
-
-# Database helper functions
-def add_group(group_id, group_name):
-    """Add a group to database"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR IGNORE INTO groups (group_id, group_name)
-        VALUES (?, ?)
-    ''', (group_id, group_name))
-    conn.commit()
-    conn.close()
-
-def get_group_settings(group_id):
-    """Get group quiz settings"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT quiz_active, interval_minutes, last_question_id
-        FROM groups WHERE group_id = ?
-    ''', (group_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result if result else (True, 30, 0)
-
-def update_group_settings(group_id, **kwargs):
-    """Update group settings"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    
-    for key, value in kwargs.items():
-        cursor.execute(f'''
-            UPDATE groups SET {key} = ? WHERE group_id = ?
-        ''', (value, group_id))
-    
-    conn.commit()
-    conn.close()
-
-def add_or_update_player(user_id, group_id, username, first_name):
-    """Add or update player in database"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR REPLACE INTO players (user_id, group_id, username, first_name, score, correct_answers, wrong_answers, current_streak, max_streak)
-        VALUES (?, ?, ?, ?, 
-                COALESCE((SELECT score FROM players WHERE user_id = ? AND group_id = ?), 0),
-                COALESCE((SELECT correct_answers FROM players WHERE user_id = ? AND group_id = ?), 0),
-                COALESCE((SELECT wrong_answers FROM players WHERE user_id = ? AND group_id = ?), 0),
-                COALESCE((SELECT current_streak FROM players WHERE user_id = ? AND group_id = ?), 0),
-                COALESCE((SELECT max_streak FROM players WHERE user_id = ? AND group_id = ?), 0))
-    ''', (user_id, group_id, username, first_name, user_id, group_id, user_id, group_id, user_id, group_id, user_id, group_id, user_id, group_id))
-    conn.commit()
-    conn.close()
-
-def update_player_score(user_id, group_id, points, is_correct):
-    """Update player score and statistics"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    
-    if is_correct:
-        cursor.execute('''
-            UPDATE players 
-            SET score = score + ?, 
-                correct_answers = correct_answers + 1,
-                current_streak = current_streak + 1,
-                max_streak = MAX(max_streak, current_streak + 1),
-                last_answer_time = CURRENT_TIMESTAMP
-            WHERE user_id = ? AND group_id = ?
-        ''', (points, user_id, group_id))
-    else:
-        cursor.execute('''
-            UPDATE players 
-            SET score = score + ?, 
-                wrong_answers = wrong_answers + 1,
-                current_streak = 0,
-                last_answer_time = CURRENT_TIMESTAMP
-            WHERE user_id = ? AND group_id = ?
-        ''', (points, user_id, group_id))
-    
-    conn.commit()
-    conn.close()
-
-def get_next_question(group_id):
-    """Get next unused question for the group"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-
-    # Check if any questions exist at all
-    cursor.execute('SELECT COUNT(*) FROM questions')
-    total_questions = cursor.fetchone()[0]
-
-    if total_questions == 0:
-        conn.close()
-        return None # No questions in database
-    
-    # Get questions not used by this group
-    cursor.execute('''
-        SELECT q.* FROM questions q
-        LEFT JOIN question_usage qu ON q.id = qu.question_id AND qu.group_id = ?
-        WHERE qu.question_id IS NULL
-        ORDER BY RANDOM()
-        LIMIT 1
-    ''', (group_id,))
-    
-    question = cursor.fetchone()
-    
-    # If all questions used, reset and get random question
-    if not question:
-        cursor.execute('DELETE FROM question_usage WHERE group_id = ?', (group_id,))
-        cursor.execute('SELECT * FROM questions ORDER BY RANDOM() LIMIT 1')
-        question = cursor.fetchone()
-    
-    # Mark question as used
-    if question:
-        cursor.execute('''
-            INSERT OR REPLACE INTO question_usage (group_id, question_id)
-            VALUES (?, ?)
-        ''', (group_id, question[0]))
-    
-    conn.commit()
-    conn.close()
-    return question
-
-def get_group_leaderboard(group_id, limit=10):
-    """Get group leaderboard"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT user_id, username, first_name, score, correct_answers, wrong_answers, current_streak, max_streak
-        FROM players
-        WHERE group_id = ?
-        ORDER BY score DESC, correct_answers DESC
-        LIMIT ?
-    ''', (group_id, limit))
-    result = cursor.fetchall()
-    conn.close()
-    return result
-
-def reset_group_leaderboard(group_id):
-    """Reset group leaderboard"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        UPDATE players 
-        SET score = 0, correct_answers = 0, wrong_answers = 0, current_streak = 0, max_streak = 0
-        WHERE group_id = ?
-    ''', (group_id,))
-    cursor.execute('DELETE FROM question_usage WHERE group_id = ?', (group_id,))
-    conn.commit()
-    conn.close()
-
-def store_active_poll(group_id, poll_id, question_id, message_id):
-    """Store active poll information"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT OR REPLACE INTO active_polls (group_id, poll_id, question_id, message_id)
-        VALUES (?, ?, ?, ?)
-    ''', (group_id, poll_id, question_id, message_id))
-    conn.commit()
-    conn.close()
-
-def get_active_poll(group_id):
-    """Get active poll for group"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        SELECT poll_id, question_id, message_id FROM active_polls WHERE group_id = ?
-    ''', (group_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result
-
-def remove_active_poll(group_id):
-    """Remove active poll"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM active_polls WHERE group_id = ?', (group_id,))
-    conn.commit()
-    conn.close()
-
-# ---------------- TELEGRAM CLIENT SETUP ----------------
+# ---------------- CONFIG ----------------
 API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH", "")
+API_HASH = os.environ.get("API_HASH", "" )
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", 0))
 
-client = TelegramClient('quiz_bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+DB_URL = os.environ.get("DATABASE_URL")  # Supabase connection string
+DB_PATH = os.environ.get("DB_PATH", "quiz_bot.db")  # fallback file path for sqlite
+KEEPALIVE_URL = os.environ.get("KEEPALIVE_URL", "")
+KEEPALIVE_INTERVAL = int(os.environ.get("KEEPALIVE_INTERVAL", 240))
 
-# Global storage for scheduled tasks
-group_tasks = {}
+USE_POSTGRES = bool(DB_URL)
+if USE_POSTGRES and asyncpg is None:
+    raise RuntimeError("DATABASE_URL set but asyncpg not installed. Add asyncpg to requirements.")
+if (not USE_POSTGRES) and aiosqlite is None:
+    # aiosqlite useful for async sqlite; if missing we'll try to import sync sqlite later
+    raise RuntimeError("aiosqlite not installed. Add aiosqlite to requirements or set DATABASE_URL.")
 
-# ---------------- QUIZ FUNCTIONS ----------------
+# ---------------- TELEGRAM CLIENT ----------------
+client = TelegramClient("quiz_bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+BOT_USERNAME = None
 
-def mention_name(user):
-    return f"<a href='tg://user?id={user.id}'>{user.first_name}</a>"
+# Scheduler tasks
+_group_tasks: dict[int, asyncio.Task] = {}
 
-async def send_quiz_question(group_id):
-    """Send a quiz question to the group"""
+# ---------------- DB: schema ----------------
+CREATE_TABLES = {
+    "groups": (
+        "CREATE TABLE IF NOT EXISTS groups ("
+        "group_id BIGINT PRIMARY KEY,"
+        "group_name TEXT,"
+        "quiz_active BOOLEAN DEFAULT TRUE,"
+        "interval_minutes INTEGER DEFAULT 30,"
+        "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    ),
+    "users": (
+        "CREATE TABLE IF NOT EXISTS users ("
+        "user_id BIGINT PRIMARY KEY,"
+        "username TEXT,"
+        "first_name TEXT,"
+        "started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    ),
+    "players": (
+        "CREATE TABLE IF NOT EXISTS players ("
+        "id SERIAL PRIMARY KEY,"
+        "user_id BIGINT,"
+        "group_id BIGINT,"
+        "username TEXT,"
+        "first_name TEXT,"
+        "score INTEGER DEFAULT 0,"
+        "correct_answers INTEGER DEFAULT 0,"
+        "wrong_answers INTEGER DEFAULT 0,"
+        "current_streak INTEGER DEFAULT 0,"
+        "max_streak INTEGER DEFAULT 0,"
+        "last_answer_time TIMESTAMP,"
+        "UNIQUE(user_id, group_id)"
+        ")"
+    ),
+    "questions": (
+        "CREATE TABLE IF NOT EXISTS questions ("
+        "id SERIAL PRIMARY KEY,"
+        "question TEXT NOT NULL,"
+        "option_a TEXT NOT NULL,"
+        "option_b TEXT NOT NULL,"
+        "option_c TEXT NOT NULL,"
+        "option_d TEXT NOT NULL,"
+        "correct_answer INTEGER NOT NULL,"
+        "category TEXT DEFAULT 'General',"
+        "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    ),
+    "question_usage": (
+        "CREATE TABLE IF NOT EXISTS question_usage ("
+        "group_id BIGINT,"
+        "question_id BIGINT,"
+        "used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+        "PRIMARY KEY (group_id, question_id)"
+        ")"
+    ),
+    "active_polls": (
+        "CREATE TABLE IF NOT EXISTS active_polls ("
+        "group_id BIGINT PRIMARY KEY,"
+        "poll_id TEXT,"
+        "question_id BIGINT,"
+        "message_id BIGINT,"
+        "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        ")"
+    )
+}
+
+# ---------------- DB helpers (async) ----------------
+async def init_db():
+    # Create tables and add sample questions if empty
+    if USE_POSTGRES:
+        conn = await asyncpg.connect(DB_URL)
+        for q in CREATE_TABLES.values():
+            await conn.execute(q)
+        # sample questions
+        count = await conn.fetchval("SELECT COUNT(*) FROM questions")
+        if count == 0:
+            await conn.executemany(
+                "INSERT INTO questions (question, option_a, option_b, option_c, option_d, correct_answer, category) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                [
+                    ("What is the capital of France?","London","Berlin","Paris","Madrid",2,"Geography"),
+                    ("Which planet is called Red Planet?","Venus","Mars","Jupiter","Saturn",1,"Science"),
+                    ("Square root of 144?","10","11","12","13",2,"Math")
+                ]
+            )
+        await conn.close()
+    else:
+        # sqlite via aiosqlite
+        async with aiosqlite.connect(DB_PATH) as db:
+            for q in CREATE_TABLES.values():
+                await db.execute(q)
+            await db.commit()
+            cur = await db.execute("SELECT COUNT(*) FROM questions")
+            row = await cur.fetchone()
+            if row and row[0] == 0:
+                await db.executemany(
+                    "INSERT INTO questions (question, option_a, option_b, option_c, option_d, correct_answer, category) VALUES (?,?,?,?,?,?,?)",
+                    [
+                        ("What is the capital of France?","London","Berlin","Paris","Madrid",2,"Geography"),
+                        ("Which planet is called Red Planet?","Venus","Mars","Jupiter","Saturn",1,"Science"),
+                        ("Square root of 144?","10","11","12","13",2,"Math")
+                    ]
+                )
+                await db.commit()
+
+# Generic query helpers
+async def db_fetch(query: str, *params):
+    if USE_POSTGRES:
+        conn = await asyncpg.connect(DB_URL)
+        rows = await conn.fetch(query, *params)
+        await conn.close()
+        return rows
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(query, params)
+            rows = await cur.fetchall()
+            return rows
+
+async def db_fetchrow(query: str, *params):
+    if USE_POSTGRES:
+        conn = await asyncpg.connect(DB_URL)
+        row = await conn.fetchrow(query, *params)
+        await conn.close()
+        return row
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(query, params)
+            row = await cur.fetchone()
+            return row
+
+async def db_execute(query: str, *params):
+    if USE_POSTGRES:
+        conn = await asyncpg.connect(DB_URL)
+        await conn.execute(query, *params)
+        await conn.close()
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(query, params)
+            await db.commit()
+
+# Convenience wrappers used by bot logic
+async def add_group(group_id: int, group_name: str):
+    if USE_POSTGRES:
+        await db_execute("INSERT INTO groups (group_id, group_name) VALUES ($1,$2) ON CONFLICT (group_id) DO NOTHING", group_id, group_name)
+    else:
+        await db_execute("INSERT OR IGNORE INTO groups (group_id, group_name) VALUES (?,?)", group_id, group_name)
+
+async def get_group_settings(group_id: int) -> Tuple[bool,int]:
+    row = await db_fetchrow("SELECT quiz_active, interval_minutes FROM groups WHERE group_id=$1" if USE_POSTGRES else "SELECT quiz_active, interval_minutes FROM groups WHERE group_id=?", group_id)
+    if not row:
+        return True, 30
+    # row types differ
+    return bool(row[0]), int(row[1])
+
+async def update_group_settings(group_id: int, **kwargs):
+    # simple approach: update each key
+    for k,v in kwargs.items():
+        if USE_POSTGRES:
+            await db_execute(f"UPDATE groups SET {k}=$1 WHERE group_id=$2", v, group_id)
+        else:
+            await db_execute(f"UPDATE groups SET {k}=? WHERE group_id=?", v, group_id)
+
+async def add_or_update_player(user_id:int, group_id:int, username:Optional[str], first_name:str):
+    if USE_POSTGRES:
+        await db_execute(
+            "INSERT INTO players (user_id, group_id, username, first_name) VALUES ($1,$2,$3,$4) ON CONFLICT (user_id, group_id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name",
+            user_id, group_id, username, first_name
+        )
+    else:
+        await db_execute(
+            "INSERT INTO players (user_id, group_id, username, first_name) VALUES (?,?,?,?) ON CONFLICT(user_id, group_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name" if False else "INSERT OR REPLACE INTO players (user_id, group_id, username, first_name) VALUES (?,?,?,?)",
+            user_id, group_id, username, first_name
+        )
+
+async def update_player_score(user_id:int, group_id:int, points:int, is_correct:bool):
+    if is_correct:
+        if USE_POSTGRES:
+            await db_execute(
+                "UPDATE players SET score = score + $1, correct_answers = correct_answers + 1, current_streak = current_streak + 1, max_streak = GREATEST(max_streak, current_streak + 1), last_answer_time = CURRENT_TIMESTAMP WHERE user_id=$2 AND group_id=$3",
+                points, user_id, group_id
+            )
+        else:
+            await db_execute(
+                "UPDATE players SET score = score + ?, correct_answers = correct_answers + 1, current_streak = current_streak + 1, max_streak = CASE WHEN max_streak < current_streak+1 THEN current_streak+1 ELSE max_streak END, last_answer_time = CURRENT_TIMESTAMP WHERE user_id=? AND group_id=?",
+                points, user_id, group_id
+            )
+    else:
+        if USE_POSTGRES:
+            await db_execute("UPDATE players SET score = score + $1, wrong_answers = wrong_answers + 1, current_streak = 0, last_answer_time = CURRENT_TIMESTAMP WHERE user_id=$2 AND group_id=$3", points, user_id, group_id)
+        else:
+            await db_execute("UPDATE players SET score = score + ?, wrong_answers = wrong_answers + 1, current_streak = 0, last_answer_time = CURRENT_TIMESTAMP WHERE user_id=? AND group_id=?", points, user_id, group_id)
+
+async def get_next_question(group_id:int):
+    # choose unused question for group
+    if USE_POSTGRES:
+        rows = await db_fetch(
+            "SELECT q.* FROM questions q LEFT JOIN question_usage qu ON q.id=qu.question_id AND qu.group_id=$1 WHERE qu.question_id IS NULL ORDER BY RANDOM() LIMIT 1", group_id
+        )
+        if not rows:
+            await db_execute("DELETE FROM question_usage WHERE group_id=$1", group_id)
+            rows = await db_fetch("SELECT * FROM questions ORDER BY RANDOM() LIMIT 1")
+        q = rows[0] if rows else None
+        if q:
+            await db_execute("INSERT INTO question_usage (group_id, question_id) VALUES ($1,$2) ON CONFLICT DO NOTHING", group_id, q[0])
+        return q
+    else:
+        rows = await db_fetch("SELECT q.* FROM questions q LEFT JOIN question_usage qu ON q.id=qu.question_id AND qu.group_id=? WHERE qu.question_id IS NULL ORDER BY RANDOM() LIMIT 1", group_id)
+        if not rows:
+            await db_execute("DELETE FROM question_usage WHERE group_id=?", group_id)
+            rows = await db_fetch("SELECT * FROM questions ORDER BY RANDOM() LIMIT 1")
+        q = rows[0] if rows else None
+        if q:
+            await db_execute("INSERT OR REPLACE INTO question_usage (group_id, question_id) VALUES (?,?)", group_id, q[0])
+        return q
+
+async def store_active_poll(group_id:int, poll_id:str, question_id:int, message_id:int):
+    if USE_POSTGRES:
+        await db_execute("INSERT INTO active_polls (group_id, poll_id, question_id, message_id) VALUES ($1,$2,$3,$4) ON CONFLICT (group_id) DO UPDATE SET poll_id=EXCLUDED.poll_id, question_id=EXCLUDED.question_id, message_id=EXCLUDED.message_id", group_id, poll_id, question_id, message_id)
+    else:
+        await db_execute("INSERT OR REPLACE INTO active_polls (group_id, poll_id, question_id, message_id) VALUES (?,?,?,?)", group_id, poll_id, question_id, message_id)
+
+async def get_active_poll(group_id:int):
+    row = await db_fetchrow("SELECT poll_id, question_id, message_id FROM active_polls WHERE group_id=$1" if USE_POSTGRES else "SELECT poll_id, question_id, message_id FROM active_polls WHERE group_id=?", group_id)
+    return row
+
+async def remove_active_poll(group_id:int):
+    if USE_POSTGRES:
+        await db_execute("DELETE FROM active_polls WHERE group_id=$1", group_id)
+    else:
+        await db_execute("DELETE FROM active_polls WHERE group_id=?", group_id)
+
+async def get_group_leaderboard(group_id:int, limit:int=10):
+    rows = await db_fetch("SELECT user_id, username, first_name, score, correct_answers, wrong_answers, current_streak, max_streak FROM players WHERE group_id=$1 ORDER BY score DESC, correct_answers DESC LIMIT $2" if USE_POSTGRES else "SELECT user_id, username, first_name, score, correct_answers, wrong_answers, current_streak, max_streak FROM players WHERE group_id=? ORDER BY score DESC, correct_answers DESC LIMIT ?", group_id, limit)
+    return rows
+
+async def get_all_users():
+    rows = await db_fetch("SELECT DISTINCT user_id FROM users")
+    return [r[0] for r in rows]
+
+async def get_all_groups():
+    rows = await db_fetch("SELECT group_id FROM groups")
+    return [r[0] for r in rows]
+
+# ---------------- Utilities ----------------
+async def is_owner(event) -> bool:
+    return event.sender_id == OWNER_ID
+
+async def is_admin(event) -> bool:
+    if not event.is_group:
+        return False
     try:
-        # Check if quiz is active for this group
-        quiz_active, interval_minutes, _ = get_group_settings(group_id)
-        if not quiz_active:
+        perms = await client.get_permissions(event.chat_id, event.sender_id)
+        if getattr(perms, 'is_admin', False) or getattr(perms, 'is_creator', False):
+            return True
+    except Exception:
+        pass
+    # Anonymous admin heuristics
+    msg = event.message
+    if getattr(msg, 'post_author', None) is not None:
+        return True
+    if msg and msg.sender_id and event.chat_id and msg.sender_id == event.chat_id:
+        return True
+    return False
+
+def html_escape(s: str) -> str:
+    return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
+
+# ---------------- Quiz sending (Telethon poll API) ----------------
+async def send_quiz_question(group_id: int):
+    try:
+        active, interval = await get_group_settings(group_id)
+        if not active:
             return
-        
-        # Delete previous poll if exists
-        active_poll = get_active_poll(group_id)
-        if active_poll:
+        ap = await get_active_poll(group_id)
+        if ap:
             try:
-                await client.delete_messages(group_id, active_poll[2])
-            except:
+                await client.delete_messages(group_id, ap[2])
+            except Exception:
                 pass
-            remove_active_poll(group_id)
-        
-        # Get next question
-        question = get_next_question(group_id)
-        if not question:
-            print(f"❌ No questions available for group {group_id}")
+            await remove_active_poll(group_id)
+        q = await get_next_question(group_id)
+        if not q:
+            print(f"[WARN] No questions for {group_id}")
             return
-        
-        question_id, question_text, opt_a, opt_b, opt_c, opt_d, correct_answer, category = question[:8]
-        
-        
-        # Build poll object
+        # q columns: id, question, option_a, option_b, option_c, option_d, correct_answer, category ...
+        qid = q[0]; text = q[1]; a = q[2]; b = q[3]; c = q[4]; d = q[5]; correct = int(q[6]); category = q[7]
+
+        answers = [
+            types.PollAnswer(text=a, option=b"A"),
+            types.PollAnswer(text=b, option=b"B"),
+            types.PollAnswer(text=c, option=b"C"),
+            types.PollAnswer(text=d, option=b"D"),
+        ]
+        correct_byte = bytes([65 + correct])
         poll = types.Poll(
             id=0,
-            question=question_text,
-            answers=[
-                types.PollAnswer(text=opt_a, option=b"A"),
-                types.PollAnswer(text=opt_b, option=b"B"),
-                types.PollAnswer(text=opt_c, option=b"C"),
-                types.PollAnswer(text=opt_d, option=b"D"),
-            ],
+            question=text,
+            answers=answers,
             multiple_choice=False,
             quiz=True,
-            correct_answers=[bytes([65 + correct_answer])]  # "A", "B", "C", "D"
+            public_voters=False,
+            close_date=None,
+            closed=False,
+            correct_answers=[correct_byte],
+            solution=None,
+            solution_entities=None,
         )
-
-        # Send poll via request
-        result = await client(
-            functions.messages.SendMessageRequest(
-                peer=group_id,
-                message=f"📚 **Quiz Time!** 📚\n\n**Category:** {category}\n\n{question_text}",
-                media=types.InputMediaPoll(poll=poll),
-                random_id=random.randint(1, 999999999)
-            )
-        )
-
-        # Store poll info
-        store_active_poll(group_id, str(poll.id), question_id, result.id)
-
-        print(f"✅ Quiz question sent to group {group_id}")
-
+        caption = f"📚 <b>Quiz Time!</b>\n\n<b>Category:</b> {html_escape(category)}\n\n{html_escape(text)}"
+        updates = await client(functions.messages.SendMediaRequest(peer=group_id, media=types.InputMediaPoll(poll=poll), message=caption, random_id=random.getrandbits(64), parse_mode='html'))
+        # extract message and poll id
+        message_id = None; poll_id = None
+        for u in updates.updates:
+            try:
+                m = u.message
+                message_id = m.id
+                poll_id = m.media.poll.id
+                break
+            except Exception:
+                continue
+        if message_id and poll_id:
+            await store_active_poll(group_id, str(poll_id), qid, message_id)
+        print(f"[OK] Quiz sent to {group_id} msg={message_id}")
     except Exception as e:
-        print(f"❌ Error sending quiz to group {group_id}: {e}")
+        print(f"[ERR] send_quiz_question {group_id}: {e}")
 
-async def schedule_quiz_for_group(group_id):
-    """Schedule recurring quiz for a group"""
+async def schedule_quiz_for_group(group_id: int):
     while True:
         try:
-            quiz_active, interval_minutes, _ = get_group_settings(group_id)
-            
-            if quiz_active:
+            active, interval = await get_group_settings(group_id)
+            if active:
                 await send_quiz_question(group_id)
-            
-            # Wait for the next interval
-            await asyncio.sleep(interval_minutes * 60)
-            
+            await asyncio.sleep(max(60, int(interval) * 60))
+        except asyncio.CancelledError:
+            break
         except Exception as e:
-            print(f"❌ Error in quiz scheduler for group {group_id}: {e}")
-            await asyncio.sleep(300)  # Wait 5 minutes before retrying
+            print(f"[ERR] scheduler {group_id}: {e}")
+            await asyncio.sleep(300)
 
-def start_group_quiz_schedule(group_id):
-    """Start quiz scheduling for a group"""
-    if group_id not in group_tasks:
-        task = asyncio.create_task(schedule_quiz_for_group(group_id))
-        group_tasks[group_id] = task
-        print(f"📅 Quiz scheduler started for group {group_id}")
+def start_group_quiz_schedule(group_id: int):
+    if group_id in _group_tasks:
+        return
+    _group_tasks[group_id] = asyncio.create_task(schedule_quiz_for_group(group_id))
 
-def stop_group_quiz_schedule(group_id):
-    """Stop quiz scheduling for a group"""
-    if group_id in group_tasks:
-        group_tasks[group_id].cancel()
-        del group_tasks[group_id]
-        print(f"🛑 Quiz scheduler stopped for group {group_id}")
+def stop_group_quiz_schedule(group_id: int):
+    t = _group_tasks.pop(group_id, None)
+    if t:
+        t.cancel()
 
-# ---------------- EVENT HANDLERS ----------------
-@client.on(events.NewMessage(pattern='/start'))
+# ---------------- Event Handlers ----------------
+@client.on(events.NewMessage(pattern=r"/start"))
 async def start_handler(event):
-    """Handle /start command"""
+    global BOT_USERNAME
+    me = await client.get_me()
+    BOT_USERNAME = me.username
     if event.is_group:
-        group_id = event.chat_id
-        group_name = event.chat.title or "Unknown Group"
-        
-        add_group(group_id, group_name)
-        start_group_quiz_schedule(group_id)
-        
-        await event.respond(
-            "🤖 **Quiz Bot Started!** 🤖\n\n"
-            "🎯 I'll send quiz questions every **30 minutes** by default.\n"
-            "📊 Answer polls to earn points: **+4** for correct, **-1** for wrong!\n\n"
-            "**Admin Commands:**\n"
-            "• `/quizstop` - Stop sending questions\n"
-            "• `/quizstart` - Resume sending questions\n"
-            "• `/setinterval <minutes>` - Set interval (5-1440 min)\n"
-            "• `/leaderboard` - Show group rankings\n"
-            "• `/resetboard` - Reset leaderboard\n\n"
-            "Let the quiz begin! 🎉"
-        )
+        gid = event.chat_id; gname = getattr(event.chat, 'title', 'Group')
+        await add_group(gid, gname)
+        start_group_quiz_schedule(gid)
+        await event.respond(("🤖 <b>Quiz Bot Enabled!</b>\n\n"
+                             "• I will send quiz polls periodically.\n"
+                             "• Default interval: <b>30 minutes</b>. Use <code>/setinterval &lt;min&gt;</code> to change.\n"
+                             "• Scoring: <b>+4</b> correct, <b>-1</b> wrong.\n\n"
+                             "<b>Admin commands</b> (creator/admins):\n"
+                             "<code>/quizstart</code> – resume sending\n"
+                             "<code>/quizstop</code> – stop sending\n"
+                             "<code>/quiznow</code> – send a question now\n"
+                             "<code>/setinterval 5..1440</code> – set minutes\n"
+                             "<code>/leaderboard</code> – group top 10\n"
+                             "<code>/resetboard</code> – clear scores\n"
+                            ), parse_mode='html')
     else:
-        # Track user in database
+        btns = [[Button.url("➕ Add me to a group", f"https://t.me/{BOT_USERNAME}?startgroup=true")],[Button.inline("📖 Help", data=b"help")]]
         user = await event.get_sender()
-        conn = sqlite3.connect('quiz_bot.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO users (user_id, username, first_name)
-            VALUES (?, ?, ?)
-        ''', (user.id, user.username, user.first_name))
-        conn.commit()
-        conn.close()
+        # ensure user stored
+        if USE_POSTGRES:
+            await db_execute("INSERT INTO users (user_id, username, first_name) VALUES ($1,$2,$3) ON CONFLICT (user_id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name", user.id, user.username, user.first_name or "")
+        else:
+            await db_execute("INSERT OR REPLACE INTO users (user_id, username, first_name) VALUES (?,?,?)", user.id, user.username, user.first_name or "")
+        await event.respond(("👋 Hi! I run timed quiz polls in groups.\nAdd me to a group and send <code>/start</code> there.\n\nOwner‑only (PM) utilities: /addquestion, /newq, /deleteallq, /questioncount, /broadcast"), buttons=btns, parse_mode='html')
 
-        await event.respond(
-            "👋 Hi! I'm a Quiz Bot for groups.\n\n"
-            "Add me to a group and use `/start` to begin the quiz fun! 🎯"
-        )
-
-@client.on(events.NewMessage(pattern='/quizstop'))
-async def quiz_stop_handler(event):
-    """Handle /quizstop command"""
-    if not event.is_group:
+@client.on(events.CallbackQuery(data=b"help"))
+async def pm_help_cb(event):
+    if not event.is_private:
+        await event.answer("Open in PM", alert=True)
         return
-    
-    # Check if user is admin
+    await event.edit(("<b>Help</b>\n\n"
+                      "➕ Add me to a group → press the button above.\n"
+                      "In a group, send <code>/start</code> to enable quizzes.\n\n"
+                      "<b>Group commands</b> (admins):\n"
+                      "• /quizstart, /quizstop, /quiznow\n"
+                      "• /setinterval &lt;5..1440&gt;\n"
+                      "• /leaderboard, /resetboard\n\n"
+                      "<b>Owner (PM)</b>: /addquestion, /newq, /deleteallq, /questioncount, /broadcast <text>"), buttons=[[Button.url("➕ Add to group", f"https://t.me/{(await client.get_me()).username}?startgroup=true")]], parse_mode='html')
+
+# group-only decorator
+def group_only(handler):
+    async def wrapper(event):
+        if not event.is_group:
+            await event.respond("⚠️ This command works only in groups. Add me to a group and try there.")
+            return
+        await handler(event)
+    return wrapper
+
+@client.on(events.NewMessage(pattern=r"/quizstop"))
+@group_only
+async def quiz_stop(event):
     if not await is_admin(event):
-        await event.respond("❌ Only group admins can use this command!")
+        await event.respond("❌ Only group admins can use this.")
         return
-    
-    group_id = event.chat_id
-    update_group_settings(group_id, quiz_active=False)
-    
-    # Delete active poll
-    active_poll = get_active_poll(group_id)
-    if active_poll:
+    gid = event.chat_id
+    await update_group_settings(gid, quiz_active=False)
+    ap = await get_active_poll(gid)
+    if ap:
         try:
-            await client.delete_messages(group_id, active_poll[2])
-        except:
+            await client.delete_messages(gid, ap[2])
+        except Exception:
             pass
-        remove_active_poll(group_id)
-    
-    await event.respond("🛑 **Quiz stopped!** No more questions will be sent until you use `/quizstart`.")
+        await remove_active_poll(gid)
+    await event.respond("🛑 Quiz stopped. Use /quizstart to resume.")
 
-@client.on(events.NewMessage(pattern='/quizstart'))
-async def quiz_start_handler(event):
-    """Handle /quizstart command"""
-    if not event.is_group:
-        return
-    
-    # Check if user is admin
+@client.on(events.NewMessage(pattern=r"/quizstart"))
+@group_only
+async def quiz_start(event):
     if not await is_admin(event):
-        await event.respond("❌ Only group admins can use this command!")
+        await event.respond("❌ Only group admins can use this.")
         return
-    
-    group_id = event.chat_id
-    update_group_settings(group_id, quiz_active=True)
-    
-    await event.respond("✅ **Quiz resumed!** Questions will be sent according to the set interval.")
+    gid = event.chat_id
+    await update_group_settings(gid, quiz_active=True)
+    start_group_quiz_schedule(gid)
+    await event.respond("✅ Quiz resumed.")
 
-@client.on(events.NewMessage(pattern=r'/setinterval (\d+)'))
-async def set_interval_handler(event):
-    """Handle /setinterval command"""
-    if not event.is_group:
-        return
-    
-    # Check if user is admin
+@client.on(events.NewMessage(pattern=r"/quiznow"))
+@group_only
+async def quiz_now(event):
     if not await is_admin(event):
-        await event.respond("❌ Only group admins can use this command!")
+        await event.respond("❌ Only group admins can use this.")
         return
-    
+    await send_quiz_question(event.chat_id)
+
+@client.on(events.NewMessage(pattern=r"/setinterval (\d+)"))
+@group_only
+async def set_interval(event):
+    if not await is_admin(event):
+        await event.respond("❌ Only group admins can use this.")
+        return
     try:
         minutes = int(event.pattern_match.group(1))
-        
         if minutes < 5 or minutes > 1440:
-            await event.respond("❌ Interval must be between 5 minutes and 24 hours (1440 minutes)!")
+            await event.respond("❌ Interval must be between 5 and 1440 minutes.")
             return
-        
-        group_id = event.chat_id
-        update_group_settings(group_id, interval_minutes=minutes)
-        
-        await event.respond(f"⏰ **Quiz interval updated!** Questions will now be sent every **{minutes} minutes**.")
-        
-    except (ValueError, AttributeError):
-        await event.respond("❌ Please use: `/setinterval <minutes>` (5-1440)")
+        await update_group_settings(event.chat_id, interval_minutes=minutes)
+        await event.respond(f"⏰ Interval set to <b>{minutes}</b> minutes.", parse_mode='html')
+    except Exception:
+        await event.respond("⚠️ Usage: /setinterval 5..1440")
 
-@client.on(events.NewMessage(pattern='/checkquestions'))
-async def check_questions_handler(event):
-    """Check if questions are available (admin only)"""
-    if not event.is_group:
+@client.on(events.NewMessage(pattern=r"/leaderboard"))
+@group_only
+async def leaderboard(event):
+    rows = await get_group_leaderboard(event.chat_id)
+    if not rows:
+        await event.respond("📊 No players yet. Answer a quiz to get on the board!")
         return
-    
+    lines = ["🏆 <b>Group Leaderboard</b>\n"]
+    medals = ["👑","🥈","🥉"]
+    for i, r in enumerate(rows, start=1):
+        uid, uname, fname, score, corr, wrong, cur, mx = r
+        rank = medals[i-1] if i<=3 else f"{i}."
+        disp = f"@{uname}" if uname else (fname or str(uid))
+        streak = f" ({cur}🔥)" if cur>0 else ""
+        lines.append(f"{rank} <b>{html_escape(disp)}</b>{streak}\n    💯 {score} | ✅ {corr} | ❌ {wrong} | 🔥 Max {mx}")
+    await event.respond("\n".join(lines), parse_mode='html')
+
+@client.on(events.NewMessage(pattern=r"/resetboard"))
+@group_only
+async def reset_board(event):
     if not await is_admin(event):
-        await event.respond("❌ Only group admins can use this command!")
+        await event.respond("❌ Only group admins can use this.")
         return
-    
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM questions')
-    count = cursor.fetchone()[0]
-    conn.close()
-    
-    if count == 0:
-        await event.respond("⚠️ **No questions in database!** Quiz will not work until questions are added.")
+    if USE_POSTGRES:
+        await db_execute("UPDATE players SET score=0, correct_answers=0, wrong_answers=0, current_streak=0, max_streak=0 WHERE group_id=$1", event.chat_id)
+        await db_execute("DELETE FROM question_usage WHERE group_id=$1", event.chat_id)
     else:
-        await event.respond(f"✅ **{count} questions** available in database.")
+        await db_execute("UPDATE players SET score=0, correct_answers=0, wrong_answers=0, current_streak=0, max_streak=0 WHERE group_id=?", event.chat_id)
+        await db_execute("DELETE FROM question_usage WHERE group_id=?", event.chat_id)
+    await event.respond("🔄 Leaderboard reset for this group.")
 
-@client.on(events.NewMessage(pattern='/leaderboard'))
-async def leaderboard_handler(event):
-    """Handle /leaderboard command"""
-    if not event.is_group:
-        return
-    
-    group_id = event.chat_id
-    leaderboard = get_group_leaderboard(group_id)
-    
-    if not leaderboard:
-        await event.respond("📊 **Group Leaderboard** 📊\n\nNo players yet! Answer some quiz questions to appear here! 🎯")
-        return
-    
-    message = "🏆 **Group Leaderboard** 🏆\n\n"
-    
-    for i, (user_id, username, first_name, score, correct, wrong, current_streak, max_streak) in enumerate(leaderboard, 1):
-        # Get user object for mention
-        try:
-            user = await client.get_entity(user_id)  # You'll need user_id from database
-            name = mention_name(user)
-        except:
-            name = username if username else (first_name or "Anonymous")
-        streak_info = f"({current_streak}🔥)" if current_streak > 0 else ""
-        
-        if i == 1:
-            message += f"👑 **{name}** {streak_info}\n"
-        elif i == 2:
-            message += f"🥈 **{name}** {streak_info}\n"
-        elif i == 3:
-            message += f"🥉 **{name}** {streak_info}\n"
-        else:
-            message += f"{i}. **{name}** {streak_info}\n"
-        
-        message += f"    💯 Score: **{score}** | ✅ {correct} | ❌ {wrong} | 🔥 Max: {max_streak}\n\n"
-    
-    await event.respond(message, parse_mode='html')
-
-@client.on(events.NewMessage(pattern='/resetboard'))
-async def reset_board_handler(event):
-    """Handle /resetboard command"""
-    if not event.is_group:
-        return
-    
-    # Check if user is admin
-    if not await is_admin(event):
-        await event.respond("❌ Only group admins can use this command!")
-        return
-    
-    group_id = event.chat_id
-    reset_group_leaderboard(group_id)
-    
-    await event.respond("🔄 **Leaderboard reset!** All scores and statistics have been cleared. Fresh start for everyone! 🎯")
-
-@client.on(events.Raw(types=[UpdateMessagePollVote]))
-async def poll_vote_handler(event):
-    """Handle poll vote updates"""
-    try:
-        poll_update = event
-        user_id = poll_update.user_id
-        poll_id = poll_update.poll_id
-        
-        # Get the message to find group_id
-        message = await client.get_messages(poll_update.peer, ids=poll_update.msg_id)
-        if not message or not hasattr(message.peer_id, 'channel_id'):
+# Owner-only PM decorator
+def owner_pm_only(handler):
+    async def wrapper(event):
+        if not event.is_private:
+            await event.respond("⚠️ PM me to use this command.")
             return
-            
-        group_id = -1000000000000 - message.peer_id.channel_id
-        
-        # Get user info
+        if not await is_owner(event):
+            await event.respond("❌ Only the bot owner can use this.")
+            return
+        await handler(event)
+    return wrapper
+
+@client.on(events.NewMessage(pattern=r"/addquestion"))
+@owner_pm_only
+async def addq_format(event):
+    await event.respond(("📝 <b>Add Question</b>\n\nSend: <code>/newq Question?|A|B|C|D|2|Category</code>\nCorrect index: 0=A,1=B,2=C,3=D"), parse_mode='html')
+
+@client.on(events.NewMessage(pattern=r"(?s)/newq (.+)"))
+@owner_pm_only
+async def addq(event):
+    try:
+        payload = event.pattern_match.group(1)
+        parts = [p.strip() for p in payload.split("|")]
+        if len(parts) != 7:
+            await event.respond("❌ Wrong format. Use /addquestion for help.")
+            return
+        q,a,b,c,d,corr,cat = parts
+        corr_i = int(corr)
+        if corr_i not in (0,1,2,3):
+            await event.respond("❌ Correct index must be 0..3")
+            return
+        if USE_POSTGRES:
+            await db_execute("INSERT INTO questions (question, option_a, option_b, option_c, option_d, correct_answer, category) VALUES ($1,$2,$3,$4,$5,$6,$7)", q,a,b,c,d,corr_i,cat)
+        else:
+            await db_execute("INSERT INTO questions (question, option_a, option_b, option_c, option_d, correct_answer, category) VALUES (?,?,?,?,?,?,?)", q,a,b,c,d,corr_i,cat)
+        await event.respond("✅ Question added.")
+    except Exception as e:
+        await event.respond(f"❌ Error: {e}")
+
+@client.on(events.NewMessage(pattern=r"/deleteallq"))
+@owner_pm_only
+async def delete_all_q(event):
+    if USE_POSTGRES:
+        await db_execute("DELETE FROM questions")
+        await db_execute("DELETE FROM question_usage")
+    else:
+        await db_execute("DELETE FROM questions")
+        await db_execute("DELETE FROM question_usage")
+    await event.respond("🗑️ All questions deleted.")
+
+@client.on(events.NewMessage(pattern=r"/questioncount"))
+@owner_pm_only
+async def qcount(event):
+    row = await db_fetchrow("SELECT COUNT(*) FROM questions" if USE_POSTGRES else "SELECT COUNT(*) FROM questions")
+    count = int(row[0]) if row else 0
+    await event.respond(f"📊 Total questions: {count}")
+
+@client.on(events.NewMessage(pattern=r"(?s)/broadcast (.+)"))
+@owner_pm_only
+async def broadcast_prep(event):
+    msg = event.pattern_match.group(1)
+    await event.respond(f"📢 <b>Broadcast preview</b>:\n\n{html_escape(msg)}\n\nReply: <code>users</code> | <code>groups</code> | <code>all</code>", parse_mode='html')
+
+@client.on(events.NewMessage(pattern=r"^(users|groups|all)$"))
+async def broadcast_do(event):
+    if not event.is_reply or not event.is_private or not await is_owner(event):
+        return
+    replied = await event.get_reply_message()
+    if not replied or "Broadcast preview" not in (replied.text or ""):
+        return
+    target = event.pattern_match.group(1)
+    try:
+        text = replied.text.split("\n\n",2)[1]
+    except Exception:
+        await event.respond("❌ Couldn't parse preview.")
+        return
+    sent = failed = 0
+    if target in ("users","all"):
+        for uid in await get_all_users():
+            try:
+                await client.send_message(uid, text, parse_mode='html')
+                sent += 1
+                await asyncio.sleep(0.08)
+            except Exception:
+                failed += 1
+    if target in ("groups","all"):
+        for gid in await get_all_groups():
+            try:
+                await client.send_message(gid, text, parse_mode='html')
+                sent += 1
+                await asyncio.sleep(0.08)
+            except Exception:
+                failed += 1
+    await event.respond(f"✅ Broadcast done. Sent: {sent} | Failed: {failed}")
+
+# Poll vote updates handler
+@client.on(events.Raw(types=[types.UpdateMessagePollVote]))
+async def on_poll_vote(event_raw):
+    try:
+        upd = event_raw
+        user_id = upd.user_id
+        msg_id = upd.msg_id
+        peer = upd.peer
+        # get peer chat id
+        group_id = get_peer_id(peer)
+        ap = await get_active_poll(group_id)
+        if not ap:
+            return
+        stored_poll_id, qid, message_id = ap
+        if message_id != msg_id:
+            return
         try:
             user = await client.get_entity(user_id)
             username = user.username
             first_name = user.first_name or ""
-        except:
-            username = None
-            first_name = "Unknown"
-        
-        # Add/update player
-        add_or_update_player(user_id, group_id, username, first_name)
-        
-        # Get the question info from our database
-        conn = sqlite3.connect('quiz_bot.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT ap.question_id, q.correct_answer
-            FROM active_polls ap
-            JOIN questions q ON ap.question_id = q.id
-            WHERE ap.group_id = ? AND ap.poll_id = ?
-        ''', (group_id, str(poll_id)))
-        result = cursor.fetchone()
-        conn.close()
-        
-        if not result:
+        except Exception:
+            username = None; first_name = 'User'
+        await add_or_update_player(user_id, group_id, username, first_name)
+        row = await db_fetchrow("SELECT correct_answer FROM questions WHERE id=$1" if USE_POSTGRES else "SELECT correct_answer FROM questions WHERE id=?", qid)
+        if not row:
             return
-        
-        question_id, correct_answer = result
-        
-        # Get selected options from the vote
-        if not hasattr(poll_update, 'options') or not poll_update.options:
+        correct_idx = int(row[0])
+        correct_byte = bytes([65 + correct_idx])
+        selected = None
+        if getattr(upd, 'options', None):
+            selected = upd.options[0]
+        if selected is None:
             return
-            
-        selected_option = poll_update.options[0]  # First selected option
-        
-        # Check if answer is correct
-        is_correct = selected_option == correct_answer
+        is_correct = (selected == correct_byte)
         points = 4 if is_correct else -1
-        
-        # Update player score
-        update_player_score(user_id, group_id, points, is_correct)
-        
-        print(f"📊 Player {username or first_name} answered {'✅ correctly' if is_correct else '❌ wrongly'} (+{points} points)")
-        
+        await update_player_score(user_id, group_id, points, is_correct)
     except Exception as e:
-        print(f"❌ Error handling poll vote: {e}")
+        print(f"[ERR] poll vote: {e}")
 
-async def is_admin(event):
-    """Check if user is group admin"""
-    try:
-        user = await event.get_sender()
-        chat = await event.get_chat()
-        
-        # Get user permissions
-        perms = await client.get_permissions(chat, user)
-        return perms.is_admin or perms.is_creator
-        
-    except:
-        return False
-    
-async def is_owner(event):
-    """Check if user is bot owner"""
-    return event.sender_id == OWNER_ID
-
-@client.on(events.NewMessage(pattern='/addquestion'))
-async def add_question_handler(event):
-    """Show format for adding questions"""
-    if not event.is_private or not await is_owner(event):
-        return
-    
-    await event.respond(
-        "📝 **Add New Question Format:**\n\n"
-        "`/newq Question text here?|Option A|Option B|Option C|Option D|2|Category`\n\n"
-        "Where `2` is the correct answer (0=A, 1=B, 2=C, 3=D)\n\n"
-        "**Example:**\n"
-        "`/newq What is 2+2?|3|4|5|6|1|Mathematics`"
-    )
-
-@client.on(events.NewMessage(pattern=r'/newq (.+)'))
-async def new_question_handler(event):
-    """Add new question to database"""
-    if not event.is_private or not await is_owner(event):
-        return
-    
-    try:
-        parts = event.pattern_match.group(1).split('|')
-        if len(parts) != 7:
-            await event.respond("❌ Wrong format! Use: question|A|B|C|D|correct_num|category")
-            return
-        
-        question, opt_a, opt_b, opt_c, opt_d, correct, category = parts
-        correct_answer = int(correct.strip())
-        
-        if correct_answer not in [0, 1, 2, 3]:
-            await event.respond("❌ Correct answer must be 0, 1, 2, or 3!")
-            return
-        
-        conn = sqlite3.connect('quiz_bot.db')
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO questions (question, option_a, option_b, option_c, option_d, correct_answer, category)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (question.strip(), opt_a.strip(), opt_b.strip(), opt_c.strip(), opt_d.strip(), correct_answer, category.strip()))
-        
-        question_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        
-        await event.respond(f"✅ **Question added successfully!**\nQuestion ID: {question_id}")
-        
-    except Exception as e:
-        await event.respond(f"❌ Error adding question: {str(e)}")
-
-@client.on(events.NewMessage(pattern='/deleteallq'))
-async def delete_all_questions_handler(event):
-    """Delete all questions from database"""
-    if not event.is_private or not await is_owner(event):
-        return
-    
-    try:
-        conn = sqlite3.connect('quiz_bot.db')
-        cursor = conn.cursor()
-        
-        # Get count first
-        cursor.execute('SELECT COUNT(*) FROM questions')
-        count = cursor.fetchone()[0]
-        
-        # Delete all questions
-        cursor.execute('DELETE FROM questions')
-        # Reset question usage for all groups
-        cursor.execute('DELETE FROM question_usage')
-        
-        conn.commit()
-        conn.close()
-        
-        await event.respond(f"🗑️ **All questions deleted!**\nRemoved {count} questions from database.\n\nDon't forget to add new questions!")
-        
-    except Exception as e:
-        await event.respond(f"❌ Error deleting questions: {str(e)}")
-
-@client.on(events.NewMessage(pattern='/questioncount'))
-async def question_count_handler(event):
-    """Show total questions count"""
-    if not event.is_private or not await is_owner(event):
-        return
-    
-    try:
-        conn = sqlite3.connect('quiz_bot.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT COUNT(*) FROM questions')
-        count = cursor.fetchone()[0]
-        conn.close()
-        
-        await event.respond(f"📊 **Total Questions:** {count}")
-        
-    except Exception as e:
-        await event.respond(f"❌ Error: {str(e)}")
-
-def get_all_users():
-    """Get all users who have used /start in PM"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT DISTINCT user_id FROM users')  # You need to create this table
-    result = cursor.fetchall()
-    conn.close()
-    return [row[0] for row in result]
-
-def get_all_groups():
-    """Get all groups where bot is active"""
-    conn = sqlite3.connect('quiz_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT group_id FROM groups')
-    result = cursor.fetchall()
-    conn.close()
-    return [row[0] for row in result]
-
-@client.on(events.NewMessage(pattern=r'(?s)/broadcast (.+)'))
-async def broadcast_handler(event):
-    """Broadcast message to all users/groups"""
-    if not event.is_private or not await is_owner(event):
-        return
-    
-    message = event.pattern_match.group(1)
-    
-    await event.respond(
-        f"📢 **Broadcasting message:**\n\n{message}\n\n"
-        "Reply with:\n"
-        "• `users` - Send to all users\n"
-        "• `groups` - Send to all groups\n"
-        "• `all` - Send to both users and groups"
-    )
-
-@client.on(events.NewMessage(pattern=r'^(users|groups|all)$'))
-async def broadcast_confirm_handler(event):
-    """Confirm and execute broadcast"""
-    if not event.is_private or not await is_owner(event) or not event.is_reply:
-        return
-    
-    # Get the message being replied to
-    replied_msg = await event.get_reply_message()
-    if not replied_msg.text.startswith("📢 **Broadcasting message:**"):
-        return
-    
-    # Extract the broadcast message
-    broadcast_text = replied_msg.text.split("\n\n")[1].split("\n\n")[0]
-    target = event.text.lower()
-    
-    sent_count = 0
-    failed_count = 0
-    
-    try:
-        if target in ['users', 'all']:
-            users = get_all_users()
-            for user_id in users:
-                try:
-                    await client.send_message(user_id, broadcast_text, parse_mode='html')
-                    sent_count += 1
-                    await asyncio.sleep(0.1)  # Avoid flood limits
-                except:
-                    failed_count += 1
-        
-        if target in ['groups', 'all']:
-            groups = get_all_groups()
-            for group_id in groups:
-                try:
-                    await client.send_message(group_id, broadcast_text, parse_mode='html')
-                    sent_count += 1
-                    await asyncio.sleep(0.1)  # Avoid flood limits
-                except:
-                    failed_count += 1
-        
-        await event.respond(
-            f"✅ **Broadcast Complete!**\n\n"
-            f"📤 Sent: {sent_count}\n"
-            f"❌ Failed: {failed_count}"
-        )
-        
-    except Exception as e:
-        await event.respond(f"❌ Broadcast failed: {str(e)}")
-
-# ---------------- FLASK KEEP-ALIVE + MAIN LOOP ----------------
-# Dummy Flask app for Render health-check
+# ---------------- Flask keep-alive ----------------
 app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "Quiz Bot is running!"
+@app.get('/')
+def root():
+    return 'Quiz Bot is running!'
+@app.get('/health')
+def health():
+    return {'ok': True, 'time': datetime.utcnow().isoformat()}
 
 def run_web():
-    # Run flask on separate process (not thread, avoids asyncio loop conflicts)
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)))
 
 async def keep_alive():
-    """Periodically ping the Render URL to prevent sleeping"""
+    if not KEEPALIVE_URL:
+        return
     while True:
         try:
-            async with aiohttp.ClientSession() as session:
-                await session.get("https://nkquizbot.onrender.com")  # Replace with your actual URL
-                print("🌍 Keep-alive ping sent!")
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(KEEPALIVE_URL) as resp:
+                    _ = await resp.text()
+            print('[PING] keep-alive sent')
         except Exception as e:
-            print(f"⚠️ Keep-alive failed: {e}")
-        await asyncio.sleep(240)  # every 4 minutes
+            print(f'[PING] failed: {e}')
+        await asyncio.sleep(KEEPALIVE_INTERVAL)
 
-if __name__ == "__main__":
-    # Initialize database
-    init_quiz_db()
-    print("📊 Database initialized!")
-    
-    # Run Flask in separate process
+# ---------------- Main ----------------
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(init_db())
+    print('[DB] init done')
     multiprocessing.Process(target=run_web, daemon=True).start()
-    print("🌐 Flask server started!")
-    
-    # Start keep-alive inside Telethon loop
-    client.loop.create_task(keep_alive())
-    
-    print("🤖 Starting Quiz Bot...")
-    print("✅ Bot is ready! Add to groups and use /start to begin!")
-    
-    # Run bot (manages its own event loop)
+    print('[WEB] flask started')
+    # start keepalive
+    if KEEPALIVE_URL:
+        client.loop.create_task(keep_alive())
+    print('[BOT] starting...')
     client.run_until_disconnected()
